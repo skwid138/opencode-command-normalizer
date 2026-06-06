@@ -1,0 +1,2 @@
+# keep in sync with opencode-council, opencode-tui, and opencode-command-normalizer
+npx --no -- commitlint --edit "$1"

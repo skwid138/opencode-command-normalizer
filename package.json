@@ -1,0 +1,65 @@
+{
+  "name": "@skwid138/opencode-command-normalizer",
+  "version": "0.1.0",
+  "description": "Command normalization plugin for opencode permission matching",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./server": {
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md",
+    "SECURITY.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build",
+    "prepare": "husky || true"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "^1.15.0"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^21.0.2",
+    "@commitlint/config-conventional": "^21.0.2",
+    "@opencode-ai/plugin": "^1.15.0",
+    "@opencode-ai/sdk": "^1.15.0",
+    "@types/node": "^22.0.0",
+    "husky": "^9.1.7",
+    "semantic-release": "^25.0.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.7"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/skwid138/opencode-command-normalizer.git"
+  },
+  "homepage": "https://github.com/skwid138/opencode-command-normalizer",
+  "bugs": {
+    "url": "https://github.com/skwid138/opencode-command-normalizer/issues"
+  },
+  "license": "MIT",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "plugin",
+    "permission",
+    "bash",
+    "canonicalize",
+    "security"
+  ]
+}
