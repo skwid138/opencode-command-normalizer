@@ -12,6 +12,8 @@ export type CanonicalizeOptions = {
 type RuntimeOptions = CanonicalizeOptions & {
   auditLogPath?: string;
   debugLogPath?: string;
+  decisionsLogPath?: string;
+  __decisionPendingLimit?: number;
 };
 
 export type AuditRecord = {
@@ -30,6 +32,47 @@ export type AuditContext = {
   debug: (message: string) => Promise<void>;
 };
 
+export type DecisionRecord = {
+  ts: string;
+  sessionID: string;
+  callID: string | null;
+  requestID: string;
+  permission: string;
+  patterns: string[];
+  always: string[];
+  reply: unknown;
+  askedTs: string;
+};
+
+type PendingPermission = {
+  callID: string | null;
+  requestID: string;
+  sessionID: string;
+  permission: string;
+  patterns: string[];
+  always: string[];
+  askedTs: string;
+};
+
+type RuntimeEventEnvelope = { id?: string; type: string; properties: unknown };
+
+type RuntimePermissionAskedProperties = {
+  id?: unknown;
+  sessionID?: unknown;
+  permission?: unknown;
+  patterns?: unknown;
+  always?: unknown;
+  tool?: unknown;
+};
+
+type RuntimePermissionRepliedProperties = {
+  sessionID?: unknown;
+  requestID?: unknown;
+  reply?: unknown;
+};
+
+const DEFAULT_PENDING_PERMISSION_LIMIT = 1000;
+
 type Segment = {
   text: string;
   start: number;
@@ -39,11 +82,39 @@ type Segment = {
 export function resolveDefaultLogPaths(
   env: Record<string, string | undefined>,
   homedir = osHomedir(),
-): { audit: string; debug: string } {
+): { audit: string; debug: string; decisions: string } {
   const xdg = env.XDG_DATA_HOME;
   const base = xdg && isAbsolute(xdg) ? xdg : join(homedir, ".local", "share");
   const dir = join(base, "opencode", "permission-audit-plugin");
-  return { audit: join(dir, "audit.log"), debug: join(dir, "debug.log") };
+  return { audit: join(dir, "audit.log"), debug: join(dir, "debug.log"), decisions: join(dir, "decisions.log") };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item) => typeof item === "string") : [];
+}
+
+// opencode session and request ids never contain NUL, so the delimiter is unambiguous.
+function pendingKey(sessionID: unknown, requestID: string): string {
+  return `${typeof sessionID === "string" ? sessionID : ""}\u0000${requestID}`;
+}
+
+function sanitizeReply(reply: unknown): unknown {
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(reply);
+  } catch {
+    try {
+      return String(reply);
+    } catch {
+      return "[unserializable reply]";
+    }
+  }
+  if (serialized === undefined) return null;
+  return reply;
 }
 
 function hasUnbalancedQuotes(command: string): boolean {
@@ -231,26 +302,72 @@ export async function canonicalizeAndAudit(
   return canonical;
 }
 
-function parseOptions(options: unknown): { enabled: boolean; canonicalizeOptions: CanonicalizeOptions; auditLogPath: string; debugLogPath: string } {
+function parseOptions(options: unknown): {
+  enabled: boolean;
+  canonicalizeOptions: CanonicalizeOptions;
+  auditLogPath: string;
+  debugLogPath: string;
+  decisionsLogPath: string;
+  decisionPendingLimit: number;
+} {
   const defaults = resolveDefaultLogPaths(process.env);
   if (options === undefined) {
-    return { enabled: true, canonicalizeOptions: {}, auditLogPath: defaults.audit, debugLogPath: defaults.debug };
+    return {
+      enabled: true,
+      canonicalizeOptions: {},
+      auditLogPath: defaults.audit,
+      debugLogPath: defaults.debug,
+      decisionsLogPath: defaults.decisions,
+      decisionPendingLimit: DEFAULT_PENDING_PERMISSION_LIMIT,
+    };
   }
   if (typeof options !== "object" || options === null || Array.isArray(options)) {
-    return { enabled: false, canonicalizeOptions: {}, auditLogPath: defaults.audit, debugLogPath: defaults.debug };
+    return {
+      enabled: false,
+      canonicalizeOptions: {},
+      auditLogPath: defaults.audit,
+      debugLogPath: defaults.debug,
+      decisionsLogPath: defaults.decisions,
+      decisionPendingLimit: DEFAULT_PENDING_PERMISSION_LIMIT,
+    };
   }
   const raw = options as RuntimeOptions;
   if (raw.roots !== undefined && (!Array.isArray(raw.roots) || !raw.roots.every((root) => typeof root === "string"))) {
-    return { enabled: false, canonicalizeOptions: {}, auditLogPath: defaults.audit, debugLogPath: defaults.debug };
+    return {
+      enabled: false,
+      canonicalizeOptions: {},
+      auditLogPath: defaults.audit,
+      debugLogPath: defaults.debug,
+      decisionsLogPath: defaults.decisions,
+      decisionPendingLimit: DEFAULT_PENDING_PERMISSION_LIMIT,
+    };
   }
   if (raw.expandBraceHome !== undefined && typeof raw.expandBraceHome !== "boolean") {
-    return { enabled: false, canonicalizeOptions: {}, auditLogPath: defaults.audit, debugLogPath: defaults.debug };
+    return {
+      enabled: false,
+      canonicalizeOptions: {},
+      auditLogPath: defaults.audit,
+      debugLogPath: defaults.debug,
+      decisionsLogPath: defaults.decisions,
+      decisionPendingLimit: DEFAULT_PENDING_PERMISSION_LIMIT,
+    };
   }
   const home = typeof raw.homedir === "string" ? raw.homedir : osHomedir();
   const expandBraceHome = raw.expandBraceHome ?? false;
   if (raw.roots?.some((root) => normalizeRoot(root, home, expandBraceHome) === null)) {
-    return { enabled: false, canonicalizeOptions: {}, auditLogPath: defaults.audit, debugLogPath: defaults.debug };
+    return {
+      enabled: false,
+      canonicalizeOptions: {},
+      auditLogPath: defaults.audit,
+      debugLogPath: defaults.debug,
+      decisionsLogPath: defaults.decisions,
+      decisionPendingLimit: DEFAULT_PENDING_PERMISSION_LIMIT,
+    };
   }
+  const pendingLimit =
+    typeof raw.__decisionPendingLimit === "number" && Number.isInteger(raw.__decisionPendingLimit) && raw.__decisionPendingLimit > 0
+      ? raw.__decisionPendingLimit
+      : DEFAULT_PENDING_PERMISSION_LIMIT;
   return {
     enabled: true,
     canonicalizeOptions: {
@@ -260,12 +377,15 @@ function parseOptions(options: unknown): { enabled: boolean; canonicalizeOptions
     },
     auditLogPath: typeof raw.auditLogPath === "string" && isAbsolute(raw.auditLogPath) ? raw.auditLogPath : defaults.audit,
     debugLogPath: typeof raw.debugLogPath === "string" && isAbsolute(raw.debugLogPath) ? raw.debugLogPath : defaults.debug,
+    decisionsLogPath: typeof raw.decisionsLogPath === "string" && isAbsolute(raw.decisionsLogPath) ? raw.decisionsLogPath : defaults.decisions,
+    decisionPendingLimit: pendingLimit,
   };
 }
 
 export const PermissionCanonicalizerPlugin: Plugin = async (_ctx, options) => {
   const parsed = parseOptions(options);
   const sessionAgents = new Map<string, string>();
+  const pendingPermissions = new Map<string, PendingPermission>();
 
   async function debug(message: string): Promise<void> {
     try {
@@ -276,6 +396,66 @@ export const PermissionCanonicalizerPlugin: Plugin = async (_ctx, options) => {
     }
   }
 
+  async function appendDecision(record: DecisionRecord): Promise<void> {
+    await appendFile(parsed.decisionsLogPath, `${JSON.stringify(record)}\n`, "utf8");
+  }
+
+  async function rememberPermissionAsked(properties: RuntimePermissionAskedProperties): Promise<void> {
+    if (typeof properties.id !== "string") return;
+    const tool = isRecord(properties.tool) ? properties.tool : null;
+    const callID = typeof tool?.callID === "string" ? tool.callID : null;
+    const askedTs = new Date().toISOString();
+    // Correlate on permission.asked.properties.id, the inner request id. The
+    // outer event.id is only the bus envelope id and does not match replies.
+    const key = pendingKey(properties.sessionID, properties.id);
+    pendingPermissions.set(key, {
+      callID,
+      requestID: properties.id,
+      sessionID: typeof properties.sessionID === "string" ? properties.sessionID : "",
+      permission: typeof properties.permission === "string" ? properties.permission : "",
+      patterns: stringArray(properties.patterns),
+      always: stringArray(properties.always),
+      askedTs,
+    });
+    await debug(`permission asked cached: requestID=${properties.id} callID=${callID ?? "null"}`);
+    if (callID === null) {
+      await debug(`permission asked missing callID: requestID=${properties.id}`);
+    }
+    while (pendingPermissions.size > parsed.decisionPendingLimit) {
+      const oldestKey = pendingPermissions.keys().next().value;
+      if (typeof oldestKey !== "string") return;
+      const evicted = pendingPermissions.get(oldestKey);
+      pendingPermissions.delete(oldestKey);
+      await debug(`permission asked evicted: requestID=${evicted?.requestID ?? "unknown"} askedTs=${evicted?.askedTs ?? "unknown"}`);
+    }
+  }
+
+  async function rememberPermissionReplied(properties: RuntimePermissionRepliedProperties): Promise<void> {
+    if (typeof properties.requestID !== "string") return;
+    const key = pendingKey(properties.sessionID, properties.requestID);
+    const pending = pendingPermissions.get(key);
+    if (!pending) {
+      await debug(`permission replied without pending ask: requestID=${properties.requestID}`);
+      return;
+    }
+    const sanitizedReply = sanitizeReply(properties.reply);
+    if (properties.reply !== "once" && properties.reply !== "always" && properties.reply !== "reject") {
+      await debug(`permission replied with unexpected reply: requestID=${properties.requestID} reply=${JSON.stringify(sanitizedReply)}`);
+    }
+    await appendDecision({
+      ts: new Date().toISOString(),
+      sessionID: pending.sessionID,
+      callID: pending.callID,
+      requestID: properties.requestID,
+      permission: pending.permission,
+      patterns: pending.patterns,
+      always: pending.always,
+      reply: sanitizedReply,
+      askedTs: pending.askedTs,
+    });
+    pendingPermissions.delete(pendingKey(properties.sessionID, properties.requestID));
+  }
+
   if (!parsed.enabled) {
     await debug("permission canonicalizer disabled due to malformed config");
     return {};
@@ -283,6 +463,7 @@ export const PermissionCanonicalizerPlugin: Plugin = async (_ctx, options) => {
 
   await mkdir(dirname(parsed.auditLogPath), { recursive: true }).catch((error) => debug(`audit directory init failed: ${error}`));
   await mkdir(dirname(parsed.debugLogPath), { recursive: true }).catch(() => undefined);
+  await mkdir(dirname(parsed.decisionsLogPath), { recursive: true }).catch((error) => debug(`decisions directory init failed: ${error}`));
 
   function rememberAgent(input: unknown): void {
     if (typeof input !== "object" || input === null) return;
@@ -317,6 +498,24 @@ export const PermissionCanonicalizerPlugin: Plugin = async (_ctx, options) => {
       });
       toolOutput.args.command = canonical;
       await debug(canonical === original ? `pass-through: ${original}` : `rewrite: ${original} -> ${canonical}`);
+    },
+    event: async (input: unknown) => {
+      try {
+        if (!isRecord(input) || !isRecord(input.event)) return;
+        const event = input.event as RuntimeEventEnvelope;
+        if (typeof event.type !== "string") return;
+        if (event.type === "permission.asked") {
+          if (!isRecord(event.properties)) return;
+          await rememberPermissionAsked(event.properties);
+          return;
+        }
+        if (event.type === "permission.replied") {
+          if (!isRecord(event.properties)) return;
+          await rememberPermissionReplied(event.properties);
+        }
+      } catch (error) {
+        await debug(`permission decision event failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
     },
   };
 };
