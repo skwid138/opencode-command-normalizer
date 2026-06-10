@@ -55,6 +55,7 @@ Options:
 | `homedir` | `string` | OS home directory | Test/advanced override for home expansion. |
 | `auditLogPath` | `string` | data-home audit log | Absolute path override for the NDJSON audit log. Relative paths are ignored. |
 | `debugLogPath` | `string` | data-home debug log | Absolute path override for debug messages. Relative paths are ignored. |
+| `decisionsLogPath` | `string` | data-home decisions log | Absolute path override for the NDJSON permission decision log. Relative paths are ignored. |
 
 Default logs resolve lazily at plugin startup. If `XDG_DATA_HOME` is set to a
 truthy absolute path, logs live below that directory; otherwise they live below
@@ -62,9 +63,9 @@ truthy absolute path, logs live below that directory; otherwise they live below
 `opencode/permission-audit-plugin` for continuity, even though the package is now
 named command-normalizer.
 
-`auditLogPath` and `debugLogPath` overrides must be absolute paths. Relative
-override values are ignored and the defaults are used instead, preserving the
-plugin's fail-open posture for malformed configuration.
+`auditLogPath`, `debugLogPath`, and `decisionsLogPath` overrides must be absolute
+paths. Relative override values are ignored and the defaults are used instead,
+preserving the plugin's fail-open posture for malformed configuration.
 
 ## How it works
 
@@ -84,6 +85,51 @@ the original command unchanged for uncertain shell shapes such as heredocs,
 command substitution, arithmetic expansion, process substitution, unbalanced
 quotes, leading environment assignments, grouped commands, quoted `argv0`, and
 dot-dot `argv0` values when roots are configured.
+
+## Decision capture
+
+The plugin also listens to opencode's generic `event` hook for interactive
+permission prompts. It caches `permission.asked` events by the pair
+`(event.properties.sessionID, event.properties.id)`, then joins the later
+`permission.replied` event by `(event.properties.sessionID,
+event.properties.requestID)`. Joined decisions are appended as NDJSON to a
+separate `decisions.log`; the command-node `audit.log` schema is unchanged.
+
+Decision records have this shape:
+
+```ts
+{
+  ts: string;            // reply time
+  sessionID: string;
+  callID: string | null; // from permission.asked.properties.tool.callID
+  requestID: string;
+  permission: string;
+  patterns: string[];
+  always: string[];      // candidate patterns offered at ask time, independent of the chosen reply
+  reply: unknown;        // recorded reply value; normally "once", "always", or "reject"
+  askedTs: string;       // ask time
+}
+```
+
+`reply` is normalized before writing so malformed runtime values cannot drop a
+decision record. JSON-serializable values are preserved verbatim. `undefined`,
+functions, symbols, and non-finite numbers are recorded as `null` in the NDJSON
+output. Values that fail JSON serialization, such as `BigInt`, circular objects,
+or throwing `toJSON` implementations, are coerced to a string; if string coercion
+also fails, the plugin records `"[unserializable reply]"`.
+
+Runtime event coverage:
+
+| Permission path | Events emitted | Decision log entry |
+| --- | --- | --- |
+| Static allow | none | no |
+| Static deny | none | no |
+| Interactive ask | `permission.asked` + `permission.replied` | yes |
+
+Use `callID` to join a decision record back to the command audit record emitted
+for the same bash tool invocation. If opencode omits the asked event's tool
+callID, the decision record uses `callID: null` and the plugin writes a debug
+line so the gap is visible.
 
 ## Development
 

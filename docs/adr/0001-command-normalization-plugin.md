@@ -69,7 +69,30 @@ disable the plugin.
   the same subfolder. Append failures are caught and logged to debug when
   possible, and debug-write failures are swallowed, so audit logging cannot
   change the canonicalized command returned to opencode.
+- The plugin captures interactive permission decisions through opencode's
+  interim generic `event` hook. It caches `permission.asked` by the composite
+  `(properties.sessionID, properties.id)` key, joins
+  `permission.replied` by `(properties.sessionID, properties.requestID)`, and
+  writes a separate `decisions.log` record. Static allow and static deny paths do
+  not emit permission events, so they are not represented in this log. The
+  in-memory key uses a NUL delimiter because opencode session and request ids do
+  not contain NUL.
+- Decision capture normalizes `reply` before writing. JSON-serializable values
+  are preserved verbatim; `undefined`, functions, symbols, and non-finite
+  numbers are recorded as `null` in NDJSON; and values that fail JSON
+  serialization are coerced to a string, falling back to
+  `"[unserializable reply]"` if string coercion also fails.
+- Decision capture assumes the runtime's `permission.asked.properties.tool.callID`
+  equals the `callID` observed by `tool.execute.before` for the same bash tool
+  invocation. Unit tests can verify the local join behavior but cannot prove this
+  cross-source runtime equality; if the asked event omits `tool.callID`, the
+  plugin records `callID: null` and emits a debug line to make the gap
+  observable.
+- Decision capture also assumes the runtime's `permission.replied.properties.sessionID`
+  identifies the same session as the matching `permission.asked.properties.sessionID`.
+  A reply without the matching session id is treated as an orphan and logged to
+  debug rather than falling back to request-id-only correlation.
 - A future opencode that wires the `permission.ask` hook (observed as declared
-  but unwired in opencode v1.15.13; upstream #7006) would offer a cleaner
-  mechanism; this `tool.execute.before` approach should be revisited if that
-  lands.
+  but unwired in opencode v1.15.13; upstream #7006/#19453) would offer a cleaner
+  mechanism for decision capture; the event-hook implementation should be
+  revisited if that lands.
