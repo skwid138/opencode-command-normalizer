@@ -209,10 +209,16 @@ function expandHomeForm(argv0: string, home: string, expandBraceHome: boolean): 
   return null;
 }
 
+function trimTrailingSlashes(path: string): string {
+  let end = path.length;
+  while (end > 0 && path[end - 1] === "/") end -= 1;
+  return path.slice(0, end);
+}
+
 function normalizeRoot(root: string, home: string, expandBraceHome: boolean): string | null {
   const expanded = expandHomeForm(root, home, expandBraceHome) ?? root;
   if (!expanded.startsWith("/") || expanded.split("/").includes("..")) return null;
-  return expanded.replace(/\/+$/, "");
+  return trimTrailingSlashes(expanded);
 }
 
 function isUnderRoot(path: string, root: string): boolean {
