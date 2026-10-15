@@ -118,6 +118,35 @@ describe("permission command canonicalization", () => {
     ).toBe("~/workspace/../secret.sh");
   });
 
+  it("treats roots with trailing slashes the same as roots without them", () => {
+    for (const root of ["~/workspace///", `${HOME}/workspace//`]) {
+      expect(canonicalize("~/workspace/tools/foo.sh", { homedir: HOME, roots: [root] })).toBe(
+        homePath("workspace", "tools", "foo.sh"),
+      );
+      expect(canonicalize("~/workspace2/tools/foo.sh", { homedir: HOME, roots: [root] })).toBe(
+        "~/workspace2/tools/foo.sh",
+      );
+    }
+  });
+
+  it("treats a filesystem-root root as allowing every absolute expansion", () => {
+    for (const root of ["/", "///"]) {
+      expect(canonicalize("~/workspace/tools/foo.sh", { homedir: HOME, roots: [root] })).toBe(
+        homePath("workspace", "tools", "foo.sh"),
+      );
+    }
+  });
+
+  it("normalizes roots with long internal slash runs in linear time", () => {
+    const root = `/${"/".repeat(100_000)}x`;
+    const startedAt = performance.now();
+    const result = canonicalize("~/workspace/tools/foo.sh", { homedir: HOME, roots: [root] });
+    const elapsedMs = performance.now() - startedAt;
+
+    expect(result).toBe("~/workspace/tools/foo.sh");
+    expect(elapsedMs).toBeLessThan(200);
+  });
+
   it("splits command nodes using shell separators without treating groups as starts", () => {
     expect(splitCommandNodes("~/a && ~/b |& ~/c; ~/d & ~/e\n~/f")).toEqual([
       "~/a",
