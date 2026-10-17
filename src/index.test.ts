@@ -118,6 +118,45 @@ describe("permission command canonicalization", () => {
     ).toBe("~/workspace/../secret.sh");
   });
 
+  it("treats roots with trailing slashes the same as roots without them", () => {
+    for (const root of ["~/workspace/", "~/workspace///", `${HOME}/workspace//`]) {
+      expect(canonicalize("~/workspace/tools/foo.sh", { homedir: HOME, roots: [root] })).toBe(
+        homePath("workspace", "tools", "foo.sh"),
+      );
+      expect(canonicalize("~/workspace2/tools/foo.sh", { homedir: HOME, roots: [root] })).toBe(
+        "~/workspace2/tools/foo.sh",
+      );
+    }
+  });
+
+  it("treats a filesystem-root root as allowing every absolute expansion", () => {
+    for (const root of ["/", "///"]) {
+      expect(canonicalize("~/workspace/tools/foo.sh", { homedir: HOME, roots: [root] })).toBe(
+        homePath("workspace", "tools", "foo.sh"),
+      );
+    }
+  });
+
+  it("normalizes a root with a long slash run before a non-slash character within a bounded budget", () => {
+    // Pathological input for a backtracking trailing-slash regex: ~100K
+    // slashes followed by a non-slash. A quadratic trim takes seconds here
+    // (measured ~3.9 s for /\/+$/ on Node 22); a linear trim takes well
+    // under a millisecond. The budget is ~8x below the quadratic cost and
+    // far above the linear cost, and the best of three runs is used so a
+    // single GC or scheduling pause cannot fail the test. This bounds the
+    // cost; it does not by itself prove linearity.
+    const root = `/${"/".repeat(100_000)}x`;
+    const budgetMs = 500;
+    let bestMs = Number.POSITIVE_INFINITY;
+    for (let attempt = 0; attempt < 3 && bestMs >= budgetMs; attempt += 1) {
+      const startedAt = performance.now();
+      const result = canonicalize("~/workspace/tools/foo.sh", { homedir: HOME, roots: [root] });
+      bestMs = Math.min(bestMs, performance.now() - startedAt);
+      expect(result).toBe("~/workspace/tools/foo.sh");
+    }
+    expect(bestMs).toBeLessThan(budgetMs);
+  });
+
   it("splits command nodes using shell separators without treating groups as starts", () => {
     expect(splitCommandNodes("~/a && ~/b |& ~/c; ~/d & ~/e\n~/f")).toEqual([
       "~/a",
@@ -224,7 +263,7 @@ describe("permission canonicalizer audit side effects", () => {
     const debugPath = join(dir, "debug.log");
     const plugin = await PermissionCanonicalizerPlugin(
       {} as never,
-      { homedir: HOME, auditLogPath: auditPath, debugLogPath: debugPath },
+      { homedir: HOME, auditLogPath: auditPath, debugLogPath: debugPath, decisionsLogPath: join(dir, "decisions.log") },
     );
     const hooks = plugin as {
       "chat.params": (input: { sessionID: string; agent: string }) => Promise<void>;
@@ -644,6 +683,77 @@ describe("permission decision capture", () => {
     ).resolves.toBeUndefined();
 
     await expect(readDecisionRecords(decisionsPath)).resolves.toEqual([]);
+  });
+});
+
+describe("V1 behavior preserved across the dual-host refactor", () => {
+  it("explicit empty roots preserve the home form instead of rewriting", async () => {
+    expect(canonicalize("~/workspace/tools/foo.sh --x", { homedir: HOME, roots: [] })).toBe("~/workspace/tools/foo.sh --x");
+
+    const hooks = await createPluginHooks({ roots: [] });
+    const output = { args: { command: "$HOME/workspace/tools/foo.sh" } };
+    await hooks["tool.execute.before"]({ tool: "bash", sessionID: "ses_test", callID: "call_test" }, output);
+    expect(output.args.command).toBe("$HOME/workspace/tools/foo.sh");
+  });
+
+  it("returns the whole original bytes when a later node bails after an earlier node was rewritten", () => {
+    const commands: Array<[string, Record<string, unknown>]> = [
+      ["~/workspace/a.sh && (~/workspace/b.sh)", {}],
+      ["~/workspace/a.sh;  FOO=1 ~/workspace/b.sh", {}],
+      ["~/workspace/a.sh | \"~/workspace/b.sh\"", {}],
+      ["~/workspace/a.sh && ~/workspace/../b.sh", { roots: ["~/workspace"] }],
+    ];
+    for (const [command, opts] of commands) {
+      expect(canonicalize(command, { homedir: HOME, ...opts })).toBe(command);
+    }
+  });
+
+  it("disables the V1 adapter for invalid roots or expandBraceHome options", async () => {
+    const invalidOptions: unknown[] = [
+      { roots: "~/workspace" },
+      { roots: [1] },
+      { roots: ["relative/dir"] },
+      { roots: ["/abs/../escape"] },
+      { expandBraceHome: "yes" },
+      null,
+      [],
+      "string-options",
+    ];
+    for (const options of invalidOptions) {
+      const hooks = await PermissionCanonicalizerPlugin({} as never, options as never);
+      expect(hooks, JSON.stringify(options)).toEqual({});
+    }
+  });
+
+  it("joins the oldest pending ask at the default 1000 cap and evicts it at 1001", async () => {
+    async function askMany(count: number) {
+      const dir = await mkdtemp(join(tmpdir(), "permission-canon-cap-"));
+      const decisionsPath = join(dir, "decisions.log");
+      const hooks = await createPluginHooks({ decisionsLogPath: decisionsPath, debugLogPath: join(dir, "debug.log") });
+      for (let index = 0; index < count; index += 1) {
+        await hooks.event({
+          event: {
+            type: "permission.asked",
+            properties: { id: `req_${index}`, sessionID: "ses_cap", permission: "bash pwd", patterns: [], always: [], tool: { callID: `call_${index}` } },
+          },
+        });
+      }
+      return { hooks, decisionsPath };
+    }
+    const reply = (requestID: string) => ({ event: { type: "permission.replied", properties: { sessionID: "ses_cap", requestID, reply: "once" } } });
+
+    const atCap = await askMany(1000);
+    await atCap.hooks.event(reply("req_0"));
+    await expect(readDecisionRecords(atCap.decisionsPath)).resolves.toMatchObject([{ requestID: "req_0", callID: "call_0" }]);
+
+    const overCap = await askMany(1001);
+    await overCap.hooks.event(reply("req_0"));
+    await overCap.hooks.event(reply("req_1"));
+    await overCap.hooks.event(reply("req_1000"));
+    await expect(readDecisionRecords(overCap.decisionsPath)).resolves.toMatchObject([
+      { requestID: "req_1", callID: "call_1" },
+      { requestID: "req_1000", callID: "call_1000" },
+    ]);
   });
 });
 
