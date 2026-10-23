@@ -249,8 +249,9 @@ describe("runtime gates", () => {
   });
 
   it("is closed when the forecast canary socket path exceeds the Darwin harness limit (long canary root)", async () => {
-    const { manifest, matrix, base } = await stagedManifest();
-    manifest.canaryRoot = join(base, "canary"); // under the isolated temp root: far over 103 bytes once the socket suffix is added
+    const { manifest, matrix } = await stagedManifest();
+    manifest.canaryRoot = `/fixture/${"r".repeat(128)}`;
+    expect(Buffer.byteLength(forecastCanarySocketPath(manifest.canaryRoot))).toBeGreaterThan(103);
     const result = await checkRuntimeGates(manifest, context(matrix));
     expect(result.ok).toBe(false);
     expect(result.problems.join("\n")).toMatch(/canaryRoot: forecast canary socket: Unix socket path is \d+ UTF-8 bytes; the Darwin harness limit is 103/);

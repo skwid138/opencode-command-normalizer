@@ -72,6 +72,8 @@ type Options = {
    * launcher-isolated root; nothing is created at the synthetic path itself.
    */
   shortCanary?: boolean;
+  /** Use a long synthetic descendant to exercise the actual socket-path preflight guard. */
+  longCanary?: boolean;
   /** Make one listen call fail (returns the error to throw), to exercise partial acquisition. */
   listenFailure?: (args: unknown[]) => Error | undefined;
   /** Per-listener close behavior; the returned promise is the close confirmation. */
@@ -134,17 +136,22 @@ async function harness(opts: Options = {}) {
   const id = family === "v2" ? "v2" : "v1-floor";
   const version = family === "v2" ? "2.0.28" : "1.18.29";
   const canaryBacking = join(base, "canary-backing");
-  const canary = opts.shortCanary ? redirectedCanaryFs(canaryBacking) : null;
+  const canaryRoot = opts.longCanary ? `${SYNTHETIC_CANARY_ROOT}/${"long-canary-directory-".repeat(4)}canary` : SYNTHETIC_CANARY_ROOT;
+  const canary = opts.shortCanary || opts.longCanary ? redirectedCanaryFs(canaryBacking) : null;
   const manifest = {
     runRoot: join(base, "runs"),
-    canaryRoot: opts.shortCanary ? SYNTHETIC_CANARY_ROOT : join(base, "canary"),
+    canaryRoot: opts.shortCanary || opts.longCanary ? canaryRoot : join(base, "canary"),
     tarball: { path: join(staging, "pkg.tgz"), sha256: sha(tarball) },
     sandbox: { machServices: opts.machServices ?? [] },
     reviewedContracts: { "hosts.versionArgv": { review: "r", value: ["--version"] } },
     v2: { providers: { fake: { baseURL: "{providerBaseURL}" } }, model: "fake/fake-model", dependencyRegions: ["cache/opencode/npm"] },
     rows: [{ id, cache: family === "v2" ? { root: "{XDG_CACHE_HOME}/opencode", specDir: `${PACKAGE_NAME}@0.1.0`, generation: "0" } : { root: "{XDG_CACHE_HOME}/opencode", specDir: `${PACKAGE_NAME}@latest` } }],
   };
-  await mkdir(opts.shortCanary ? canaryBacking : manifest.canaryRoot);
+  if (opts.shortCanary || opts.longCanary) {
+    await mkdir(join(canaryBacking, relative(SYNTHETIC_CANARY_ROOT, manifest.canaryRoot)), { recursive: true });
+  } else {
+    await mkdir(manifest.canaryRoot);
+  }
   const verified = {
     node: { path: join(staging, "node") },
     packageSpec: opts.packageSpec ?? { name: PACKAGE_NAME, version: "0.1.0", spec: `${PACKAGE_NAME}@0.1.0` },
@@ -503,9 +510,9 @@ describe("runtime composition: host launch, identity, and teardown", () => {
 
 describe("runtime composition: preflight", () => {
   it("backstop: an over-limit actual canary socket path (gate forecast bypassed) is refused before any preflight listener, provider, or probe", async () => {
-    // The default harness canary root lives under the isolated temp root, so the actual
-    // <canaryRoot>/rh-canary-XXXXXX/forbidden.sock is far over 103 bytes. No gate ran here.
-    const { deps, row, fixture, launches, listeners } = await harness();
+    // A long synthetic descendant keeps the actual socket path over 103 bytes on every platform.
+    // Its canary filesystem operations are redirected into the isolated backing directory.
+    const { deps, row, fixture, launches, listeners } = await harness({ longCanary: true });
     await deps.prepare(fixture, row);
     const registryOnly = listeners.map((entry) => entry.args);
     await expect(deps.preflight(fixture, row)).rejects.toThrow(/preflight refused before any listener: canary Unix socket path is \d+ UTF-8 bytes; the Darwin harness limit is 103/);
